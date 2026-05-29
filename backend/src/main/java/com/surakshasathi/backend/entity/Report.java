@@ -3,13 +3,11 @@ package com.surakshasathi.backend.entity;
 
 import com.surakshasathi.backend.enums.ReportStatus;
 import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.Setter;
+import lombok.*;
 
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.UUID;
 
 @Entity
@@ -32,4 +30,10 @@ public class Report {
     private  String severity;
     private ReportStatus status;
     private LocalDateTime createdAt;
+    private Integer trustScore;
+    private String ipHash;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "report", fetch = FetchType.LAZY)
+    private List<Evidence> evidenceList;
+
 }

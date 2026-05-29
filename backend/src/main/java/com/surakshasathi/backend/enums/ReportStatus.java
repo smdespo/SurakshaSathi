@@ -7,5 +7,6 @@ public enum ReportStatus {
     PENDING,
     VERIFIED,
     RESOLVED,
-    REJECTED
+    REJECTED,
+    SPAM
 }
