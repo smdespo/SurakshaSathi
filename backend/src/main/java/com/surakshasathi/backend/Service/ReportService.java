@@ -2,6 +2,7 @@ package com.surakshasathi.backend.Service;
 
 import com.surakshasathi.backend.Repository.ReportRepo;
 import com.surakshasathi.backend.dto.ReportReqDTO;
+import com.surakshasathi.backend.dto.ReportResDTO;
 import com.surakshasathi.backend.entity.Report;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -51,5 +52,26 @@ public class ReportService {
                         .toString()
                         .substring(0, 8)
                         .toUpperCase();
+    }
+
+    public ReportResDTO trackReport(String trackingToken) {
+        Report report = reportRepo
+                .findByTrackingToken(trackingToken)
+                .orElseThrow(() ->
+                        new RuntimeException("Report not found"));
+
+        ReportResDTO dto = new ReportResDTO();
+
+        dto.setTitle(report.getTitle());
+        dto.setDescription(report.getDescription());
+        dto.setTrackingToken(report.getTrackingToken());
+        dto.setIncidentType(report.getIncidentType());
+        dto.setLatitude(report.getLatitude());
+        dto.setLongitude(report.getLongitude());
+        dto.setSeverity(report.getSeverity());
+        dto.setStatus(report.getStatus());
+        dto.setCreatedAt(report.getCreatedAt());
+
+        return dto;
     }
 }
