@@ -1,6 +1,7 @@
 package com.surakshasathi.backend.entity;
 
 
+import com.surakshasathi.backend.enums.ReportStatus;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -29,6 +30,6 @@ public class Report {
     private Double latitude;
     private Double longitude;
     private  String severity;
-    private String status;
+    private ReportStatus status;
     private LocalDateTime createdAt;
 }

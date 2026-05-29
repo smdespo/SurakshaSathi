@@ -1,6 +1,7 @@
 package com.surakshasathi.backend.dto;
 
 
+import com.surakshasathi.backend.enums.ReportStatus;
 import jakarta.validation.constraints.NotBlank;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -28,7 +29,7 @@ public class ReportResDTO {
 
     private String severity;
 
-    private String status;
+    private ReportStatus status;
 
     private LocalDateTime createdAt;
 }
