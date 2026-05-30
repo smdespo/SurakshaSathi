@@ -1,13 +1,17 @@
 import os
+import tempfile
 from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from dbsetup import collection
+from modelsup import DEFAULT_MODEL_PATH, load_trained_model, predict_video
 
 
 load_dotenv()
@@ -20,6 +24,8 @@ ALERT_RADIUS_METERS = 5000
 ALERT_EXPIRY_MINUTES = 30
 USER_AGENT = "surakshasathi-crime-detector"
 API_KEY = os.getenv("SURAKSHASATHI_API_KEY")
+MODEL_PATH = Path(os.getenv("VIDEO_MODEL_PATH", DEFAULT_MODEL_PATH))
+NON_CRIME_CLASSES = {"Normal"}
 
 
 app = FastAPI(title="Surakshasathi API")
@@ -124,24 +130,113 @@ def create_crime_report(areas: list[str]) -> dict:
     }
 
 
+@lru_cache(maxsize=1)
+def get_prediction_model():
+    """Load the trained TensorFlow model once and reuse it for API requests."""
+    try:
+        return load_trained_model(MODEL_PATH)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Model file not found at {MODEL_PATH}. "
+                "Train the model first using modelsup.py --mode train."
+            ),
+        ) from exc
+
+
+def create_and_store_alert(latitude: float, longitude: float, event_type: str) -> dict:
+    """Create a crime alert document enriched with nearby area details."""
+    nearby_areas = get_nearby_areas(latitude, longitude)
+    crime_report = create_crime_report(nearby_areas)
+    crime_report["event_type"] = event_type
+    crime_report["latitude"] = latitude
+    crime_report["longitude"] = longitude
+    collection.insert_one(crime_report)
+
+    return {
+        "result": "Crime alert stored successfully.",
+        "event_type": event_type,
+        "main_area": crime_report["main_area"],
+        "nearby_areas": nearby_areas,
+        "expires_in_minutes": ALERT_EXPIRY_MINUTES,
+    }
+
+
 @app.get("/")
 def health_check() -> dict[str, str]:
     return {"message": "Surakshasathi API is running."}
 
 
-@app.post("/camera-crime")
-@app.post("/update-location")
-def update_location(location: Location) -> dict:
-    nearby_areas = get_nearby_areas(location.latitude, location.longitude)
-    crime_report = create_crime_report(nearby_areas)
-    collection.insert_one(crime_report)
+@app.get("/model-status")
+def model_status() -> dict[str, str]:
+    return {"model_path": str(MODEL_PATH), "status": "ready" if MODEL_PATH.exists() else "missing"}
 
-    return {
-        "result": "Crime alert stored successfully.",
-        "main_area": crime_report["main_area"],
-        "nearby_areas": nearby_areas,
-        "expires_in_minutes": ALERT_EXPIRY_MINUTES,
+
+@app.post("/camera-crime")
+def update_location(location: Location) -> dict:
+    return create_and_store_alert(location.latitude, location.longitude, "manual_report")
+
+
+@app.post("/predict-video")
+async def predict_uploaded_video(
+    file: UploadFile = File(...),
+    latitude: float | None = Form(None),
+    longitude: float | None = Form(None),
+    create_alert: bool = Form(False),
+) -> dict:
+    file_extension = Path(file.filename or "").suffix.lower()
+    if file_extension not in {".mp4", ".avi", ".mov", ".mkv"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported video format. Use .mp4, .avi, .mov, or .mkv.",
+        )
+
+    model = get_prediction_model()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+        temp_path = Path(temp_file.name)
+        temp_file.write(await file.read())
+
+    try:
+        prediction = predict_video(temp_path, model)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    if prediction is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded video could not be processed.",
+        )
+
+    response = {
+        "video_name": prediction["video_name"],
+        "frames_used": prediction["frames_used"],
+        "predicted_class": prediction["predicted_class"],
+        "probabilities": prediction["probabilities"],
+        "alert_created": False,
     }
+
+    if create_alert:
+        if prediction["predicted_class"] in NON_CRIME_CLASSES:
+            response["alert_message"] = "Prediction is Normal, so no crime alert was created."
+            return response
+
+        if latitude is None or longitude is None:
+            raise HTTPException(
+                status_code=400,
+                detail="latitude and longitude are required when create_alert is true.",
+            )
+
+        alert_details = create_and_store_alert(
+            latitude,
+            longitude,
+            prediction["predicted_class"],
+        )
+        response["alert_created"] = True
+        response["alert_details"] = alert_details
+
+    return response
 
 
 @app.post("/notify")
