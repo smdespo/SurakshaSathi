@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import LocationTracker from './Components/LocationFetch.jsx'
+import ClientDashboard from './Client/Dashboard.jsx'
 
 
 function App() {
@@ -7,7 +8,7 @@ function App() {
 
   return (
     <>
-      <LocationTracker />
+      <ClientDashboard />
     </>
   )
 }
