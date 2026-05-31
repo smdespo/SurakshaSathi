@@ -1,33 +1,25 @@
-:root {
-  color: #10231d;
-  background: #eef7f2;
-  font-family: Georgia, "Times New Roman", serif;
-  line-height: 1.5;
-  font-weight: 400;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
 
-* {
-  box-sizing: border-box;
-}
+@import "tailwindcss";
 
-html,
-body,
-#root {
-  margin: 0;
-  min-height: 100%;
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+    box-sizing: border-box;
+  }
+  body {
+    @apply font-sans text-gray-800 bg-gray-50 antialiased;
+    -webkit-font-smoothing: antialiased;
+  }
+  input, select, textarea, button {
+    font-family: inherit;
+  }
+  /* Smooth scrolling everywhere */
+  html {
+    scroll-behavior: smooth;
+  }
 }
-
-body {
-  min-width: 320px;
-}
-
-button,
-input,
-textarea,
-select {
-  font: inherit;
+ 
+@layer utilities {
+  .z-60 { z-index: 60; }
 }
