@@ -32,6 +32,7 @@ ALERT_RADIUS_METERS = 5000
 ALERT_EXPIRY_MINUTES = 30
 SIGNED_URL_EXPIRY_SECONDS = 300
 USER_AGENT = "surakshasathi-crime-detector"
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 API_KEY = os.getenv("SURAKSHASATHI_API_KEY")
 MODEL_PATH = Path(os.getenv("VIDEO_MODEL_PATH", DEFAULT_MODEL_PATH))
 NON_CRIME_CLASSES = {"Normal"}
@@ -52,6 +53,7 @@ app.add_middleware(
 class Location(BaseModel):
     latitude: float
     longitude: float
+    accuracy: float | None = None
 
 
 class PoliceAdminCreate(BaseModel):
@@ -126,8 +128,17 @@ def parse_object_id(raw_id: str) -> ObjectId:
         raise HTTPException(status_code=400, detail=f"Invalid id: {raw_id}") from exc
 
 
+def validate_video_filename(file_name: str | None) -> str:
+    suffix = Path(file_name or "").suffix.lower()
+    if suffix not in VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported video format. Use .mp4, .avi, .mov, or .mkv.",
+        )
+    return suffix
+
+
 def get_nearby_areas(latitude: float, longitude: float) -> list[str]:
-    """Fetch nearby populated places around the crime location."""
     if not API_KEY:
         raise HTTPException(
             status_code=500,
@@ -163,19 +174,16 @@ def get_nearby_areas(latitude: float, longitude: float) -> list[str]:
         feature.get("properties", {}).get("name", "").strip()
         for feature in data.get("features", [])
     }
-
     cleaned_areas = sorted(area for area in areas if area)
     if not cleaned_areas:
         raise HTTPException(
             status_code=404,
             detail="No nearby populated areas were found for this location.",
         )
-
     return cleaned_areas
 
 
 def get_area_from_coordinates(latitude: float, longitude: float) -> str | None:
-    """Resolve the user's coordinates into a practical area name."""
     try:
         response = requests.get(
             NOMINATIM_REVERSE_URL,
@@ -201,14 +209,29 @@ def get_area_from_coordinates(latitude: float, longitude: float) -> str | None:
     )
 
 
-def create_crime_report(areas: list[str]) -> dict[str, Any]:
-    """Create a short-lived alert document for MongoDB."""
+def create_alert_document(latitude: float, longitude: float, event_type: str) -> dict[str, Any]:
+    nearby_areas = get_nearby_areas(latitude, longitude)
     now = utcnow()
     return {
-        "main_area": areas[0] if areas else None,
-        "nearby_areas": areas,
+        "event_type": event_type,
+        "main_area": nearby_areas[0] if nearby_areas else None,
+        "nearby_areas": nearby_areas,
+        "latitude": latitude,
+        "longitude": longitude,
         "detected_at": now,
         "expires_at": now + timedelta(minutes=ALERT_EXPIRY_MINUTES),
+    }
+
+
+def create_and_store_alert(latitude: float, longitude: float, event_type: str) -> dict[str, Any]:
+    alert_document = create_alert_document(latitude, longitude, event_type)
+    alerts_collection.insert_one(alert_document)
+    return {
+        "result": "Crime alert stored successfully.",
+        "event_type": event_type,
+        "main_area": alert_document["main_area"],
+        "nearby_areas": alert_document["nearby_areas"],
+        "expires_in_minutes": ALERT_EXPIRY_MINUTES,
     }
 
 
@@ -220,7 +243,6 @@ def require_super_admin(
             status_code=500,
             detail="POLICE_SUPER_ADMIN_KEY is missing. Add it to .env first.",
         )
-
     if x_super_admin_key != POLICE_SUPER_ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Invalid super admin key.")
 
@@ -244,7 +266,6 @@ def require_police_admin(
     )
     if not admin:
         raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-
     return serialize_document(admin)
 
 
@@ -254,15 +275,13 @@ def create_police_admin(payload: PoliceAdminCreate) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Admin with this email already exists.")
 
     now = utcnow()
-    admin_key = secrets.token_urlsafe(24)
     admin_document = {
         **payload.model_dump(),
-        "admin_key": admin_key,
+        "admin_key": secrets.token_urlsafe(24),
         "is_active": True,
         "created_at": now,
         "updated_at": now,
     }
-
     result = admins_collection.insert_one(admin_document)
     admin_document["_id"] = result.inserted_id
     return serialize_document(admin_document)
@@ -283,7 +302,6 @@ def create_police_report(payload: PoliceReportCreate, admin: dict[str, Any]) -> 
         "evidence_path": None,
         "evidence_uploaded_at": None,
     }
-
     result = reports_collection.insert_one(report_document)
     report_document["_id"] = result.inserted_id
     return serialize_document(report_document)
@@ -313,7 +331,6 @@ def create_public_report(payload: PublicReportCreate) -> dict[str, Any]:
         "evidence_path": None,
         "evidence_uploaded_at": None,
     }
-
     result = reports_collection.insert_one(report_document)
     report_document["_id"] = result.inserted_id
     return serialize_document(report_document)
@@ -326,7 +343,6 @@ def update_police_report(report_id: str, payload: dict[str, Any]) -> dict[str, A
 
     update_payload["updated_at"] = utcnow()
     mongo_id = parse_object_id(report_id)
-
     updated_report = reports_collection.find_one_and_update(
         {"_id": mongo_id},
         {"$set": update_payload},
@@ -334,7 +350,6 @@ def update_police_report(report_id: str, payload: dict[str, Any]) -> dict[str, A
     )
     if not updated_report:
         raise HTTPException(status_code=404, detail=f"Police report '{report_id}' was not found.")
-
     return serialize_document(updated_report)
 
 
@@ -356,22 +371,13 @@ def normalize_signed_url(url_result: Any) -> str | None:
 
 
 async def upload_police_evidence(report_id: str, file: UploadFile) -> dict[str, Any]:
-    """Upload evidence video to Supabase Storage and attach the path in MongoDB."""
-    file_extension = Path(file.filename or "").suffix.lower()
-    if file_extension not in {".mp4", ".avi", ".mov", ".mkv"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported evidence format. Use .mp4, .avi, .mov, or .mkv.",
-        )
-
-    mongo_id = parse_object_id(report_id)
-    existing_report = reports_collection.find_one({"_id": mongo_id})
-    if not existing_report:
+    validate_video_filename(file.filename)
+    report = reports_collection.find_one({"_id": parse_object_id(report_id)})
+    if not report:
         raise HTTPException(status_code=404, detail=f"Police report '{report_id}' was not found.")
 
     storage_path = build_evidence_path(file.filename or "evidence.mp4")
     file_bytes = await file.read()
-
     try:
         supabase.storage.from_(SUPABASE_EVIDENCE_BUCKET).upload(
             path=storage_path,
@@ -398,8 +404,7 @@ async def upload_police_evidence(report_id: str, file: UploadFile) -> dict[str, 
 
 
 def create_evidence_access_link(report_id: str) -> dict[str, Any]:
-    mongo_id = parse_object_id(report_id)
-    report = reports_collection.find_one({"_id": mongo_id})
+    report = reports_collection.find_one({"_id": parse_object_id(report_id)})
     if not report:
         raise HTTPException(status_code=404, detail=f"Police report '{report_id}' was not found.")
 
@@ -433,7 +438,6 @@ def create_evidence_access_link(report_id: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def get_prediction_model():
-    """Load the trained TensorFlow model once and reuse it for API requests."""
     try:
         return load_trained_model(MODEL_PATH)
     except FileNotFoundError as exc:
@@ -446,215 +450,26 @@ def get_prediction_model():
         ) from exc
 
 
-def create_and_store_alert(latitude: float, longitude: float, event_type: str) -> dict[str, Any]:
-    """Create a crime alert document in MongoDB."""
-    nearby_areas = get_nearby_areas(latitude, longitude)
-    crime_report = create_crime_report(nearby_areas)
-    crime_report["event_type"] = event_type
-    crime_report["latitude"] = latitude
-    crime_report["longitude"] = longitude
-    alerts_collection.insert_one(crime_report)
-
-    return {
-        "result": "Crime alert stored successfully.",
-        "event_type": event_type,
-        "main_area": crime_report["main_area"],
-        "nearby_areas": nearby_areas,
-        "expires_in_minutes": ALERT_EXPIRY_MINUTES,
-    }
-
-
 @app.get("/")
 def health_check() -> dict[str, str]:
     return {"message": "Surakshasathi API is running."}
 
 
-@app.post("/admin/users")
-def create_admin_user(
-    payload: PoliceAdminCreate,
-    _: None = Depends(require_super_admin),
-) -> dict[str, Any]:
-    """Create a police admin in MongoDB and return the generated admin key once."""
-    admin = create_police_admin(payload)
+@app.post("/update-location")
+def update_location(location: Location) -> dict[str, Any]:
+    area = get_area_from_coordinates(location.latitude, location.longitude)
     return {
-        "message": "Police admin created successfully.",
-        "admin": admin,
-    }
-
-
-@app.post("/admin/login")
-def login_admin(payload: PoliceAdminLogin) -> dict[str, Any]:
-    """Validate admin credentials stored in MongoDB."""
-    admin = admins_collection.find_one(
-        {
-            "email": payload.email,
-            "admin_key": payload.admin_key,
-            "is_active": True,
-        }
-    )
-    if not admin:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-
-    return {
-        "message": "Admin login successful.",
-        "admin": serialize_document(admin),
-    }
-
-
-@app.get("/admin/reports")
-def get_admin_reports(admin: dict[str, Any] = Depends(require_police_admin)) -> dict[str, Any]:
-    """List recent police case reports from MongoDB."""
-    return {
-        "message": f"Reports fetched for admin {admin['email']}.",
-        "reports": list_police_reports(),
-    }
-
-
-@app.post("/admin/reports")
-def create_admin_report(
-    payload: PoliceReportCreate,
-    admin: dict[str, Any] = Depends(require_police_admin),
-) -> dict[str, Any]:
-    """Create a police case report in MongoDB."""
-    report = create_police_report(payload, admin)
-    return {
-        "message": "Police report created successfully.",
-        "report": report,
-    }
-
-
-@app.post("/reports/public")
-async def create_public_report_with_evidence(
-    latitude: float = Form(...),
-    longitude: float = Form(...),
-    file: UploadFile = File(...),
-) -> dict[str, Any]:
-    """Allow any user to submit only location and video evidence for police review."""
-    payload = PublicReportCreate(
-        latitude=latitude,
-        longitude=longitude,
-    )
-    report = create_public_report(payload)
-    report = await upload_police_evidence(report["id"], file)
-    return {
-        "message": "Public crime report submitted successfully. Police admins can now review it.",
-        "area": report["area"],
-        "latitude": report["latitude"],
-        "longitude": report["longitude"],
-        "report": report,
-    }
-
-
-@app.patch("/admin/reports/{report_id}")
-def patch_admin_report(
-    report_id: str,
-    payload: PoliceReportUpdate,
-    _: dict[str, Any] = Depends(require_police_admin),
-) -> dict[str, Any]:
-    """Update an existing police case report in MongoDB."""
-    report = update_police_report(report_id, payload.model_dump(exclude_none=True))
-    return {
-        "message": "Police report updated successfully.",
-        "report": report,
-    }
-
-
-@app.post("/admin/reports/{report_id}/evidence")
-async def upload_admin_report_evidence(
-    report_id: str,
-    file: UploadFile = File(...),
-    _: dict[str, Any] = Depends(require_police_admin),
-) -> dict[str, Any]:
-    """Upload a private evidence video to Supabase and store only the path in MongoDB."""
-    report = await upload_police_evidence(report_id, file)
-    return {
-        "message": "Evidence uploaded successfully.",
-        "bucket": SUPABASE_EVIDENCE_BUCKET,
-        "report": report,
-    }
-
-
-@app.get("/admin/reports/{report_id}/evidence-link")
-def get_admin_report_evidence_link(
-    report_id: str,
-    _: dict[str, Any] = Depends(require_police_admin),
-) -> dict[str, Any]:
-    """Return a short-lived signed URL so only admins can access the video."""
-    return create_evidence_access_link(report_id)
-
-
-@app.get("/model-status")
-def model_status() -> dict[str, str]:
-    return {
-        "model_path": str(MODEL_PATH),
-        "status": "ready" if MODEL_PATH.exists() else "missing",
+        "message": "Location received",
+        "latitude": location.latitude,
+        "longitude": location.longitude,
+        "accuracy": location.accuracy,
+        "area": area,
     }
 
 
 @app.post("/camera-crime")
-def update_location(location: Location) -> dict[str, Any]:
+def create_camera_crime_alert(location: Location) -> dict[str, Any]:
     return create_and_store_alert(location.latitude, location.longitude, "manual_report")
-
-
-@app.post("/predict-video")
-async def predict_uploaded_video(
-    file: UploadFile = File(...),
-    latitude: float | None = Form(None),
-    longitude: float | None = Form(None),
-    create_alert: bool = Form(False),
-) -> dict[str, Any]:
-    file_extension = Path(file.filename or "").suffix.lower()
-    if file_extension not in {".mp4", ".avi", ".mov", ".mkv"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported video format. Use .mp4, .avi, .mov, or .mkv.",
-        )
-
-    model = get_prediction_model()
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-        temp_path = Path(temp_file.name)
-        temp_file.write(await file.read())
-
-    try:
-        prediction = predict_video(temp_path, model)
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-    if prediction is None:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded video could not be processed.",
-        )
-
-    response = {
-        "video_name": prediction["video_name"],
-        "frames_used": prediction["frames_used"],
-        "predicted_class": prediction["predicted_class"],
-        "probabilities": prediction["probabilities"],
-        "alert_created": False,
-    }
-
-    if create_alert:
-        if prediction["predicted_class"] in NON_CRIME_CLASSES:
-            response["alert_message"] = "Prediction is Normal, so no crime alert was created."
-            return response
-
-        if latitude is None or longitude is None:
-            raise HTTPException(
-                status_code=400,
-                detail="latitude and longitude are required when create_alert is true.",
-            )
-
-        alert_details = create_and_store_alert(
-            latitude,
-            longitude,
-            prediction["predicted_class"],
-        )
-        response["alert_created"] = True
-        response["alert_details"] = alert_details
-
-    return response
 
 
 @app.post("/notify")
@@ -672,10 +487,169 @@ def notify_users(location: Location) -> dict[str, str]:
             ],
         }
     )
-
     if active_alert:
-        return {
-            "message": f"Crime reported near {area}. Stay alert and take precautions."
-        }
-
+        return {"message": f"Crime reported near {area}. Stay alert and take precautions."}
     return {"message": f"No recent crime reports near {area}. Stay safe!"}
+
+
+@app.post("/reports/public")
+async def create_public_report_with_evidence(
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    payload = PublicReportCreate(latitude=latitude, longitude=longitude)
+    report = create_public_report(payload)
+    report = await upload_police_evidence(report["id"], file)
+    return {
+        "message": "Public crime report submitted successfully. Police admins can now review it.",
+        "area": report["area"],
+        "latitude": report["latitude"],
+        "longitude": report["longitude"],
+        "report": report,
+    }
+
+
+@app.get("/model-status")
+def model_status() -> dict[str, str]:
+    return {
+        "model_path": str(MODEL_PATH),
+        "status": "ready" if MODEL_PATH.exists() else "missing",
+    }
+
+
+@app.post("/predict-video")
+async def predict_uploaded_video(
+    file: UploadFile = File(...),
+    latitude: float | None = Form(None),
+    longitude: float | None = Form(None),
+    create_alert: bool = Form(False),
+) -> dict[str, Any]:
+    validate_video_filename(file.filename)
+    model = get_prediction_model()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as temp_file:
+        temp_path = Path(temp_file.name)
+        temp_file.write(await file.read())
+
+    try:
+        prediction = predict_video(temp_path, model)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    if prediction is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded video could not be processed.",
+        )
+
+    response: dict[str, Any] = {
+        "video_name": prediction["video_name"],
+        "frames_used": prediction["frames_used"],
+        "predicted_class": prediction["predicted_class"],
+        "probabilities": prediction["probabilities"],
+        "alert_created": False,
+    }
+
+    if create_alert:
+        if prediction["predicted_class"] in NON_CRIME_CLASSES:
+            response["alert_message"] = "Prediction is Normal, so no crime alert was created."
+            return response
+        if latitude is None or longitude is None:
+            raise HTTPException(
+                status_code=400,
+                detail="latitude and longitude are required when create_alert is true.",
+            )
+
+        response["alert_created"] = True
+        response["alert_details"] = create_and_store_alert(
+            latitude,
+            longitude,
+            prediction["predicted_class"],
+        )
+
+    return response
+
+
+@app.post("/admin/users")
+def create_admin_user(
+    payload: PoliceAdminCreate,
+    _: None = Depends(require_super_admin),
+) -> dict[str, Any]:
+    admin = create_police_admin(payload)
+    return {
+        "message": "Police admin created successfully.",
+        "admin": admin,
+    }
+
+
+@app.post("/admin/login")
+def login_admin(payload: PoliceAdminLogin) -> dict[str, Any]:
+    admin = admins_collection.find_one(
+        {
+            "email": payload.email,
+            "admin_key": payload.admin_key,
+            "is_active": True,
+        }
+    )
+    if not admin:
+        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
+    return {
+        "message": "Admin login successful.",
+        "admin": serialize_document(admin),
+    }
+
+
+@app.get("/admin/reports")
+def get_admin_reports(admin: dict[str, Any] = Depends(require_police_admin)) -> dict[str, Any]:
+    return {
+        "message": f"Reports fetched for admin {admin['email']}.",
+        "reports": list_police_reports(),
+    }
+
+
+@app.post("/admin/reports")
+def create_admin_report(
+    payload: PoliceReportCreate,
+    admin: dict[str, Any] = Depends(require_police_admin),
+) -> dict[str, Any]:
+    report = create_police_report(payload, admin)
+    return {
+        "message": "Police report created successfully.",
+        "report": report,
+    }
+
+
+@app.patch("/admin/reports/{report_id}")
+def patch_admin_report(
+    report_id: str,
+    payload: PoliceReportUpdate,
+    _: dict[str, Any] = Depends(require_police_admin),
+) -> dict[str, Any]:
+    report = update_police_report(report_id, payload.model_dump(exclude_none=True))
+    return {
+        "message": "Police report updated successfully.",
+        "report": report,
+    }
+
+
+@app.post("/admin/reports/{report_id}/evidence")
+async def upload_admin_report_evidence(
+    report_id: str,
+    file: UploadFile = File(...),
+    _: dict[str, Any] = Depends(require_police_admin),
+) -> dict[str, Any]:
+    report = await upload_police_evidence(report_id, file)
+    return {
+        "message": "Evidence uploaded successfully.",
+        "bucket": SUPABASE_EVIDENCE_BUCKET,
+        "report": report,
+    }
+
+
+@app.get("/admin/reports/{report_id}/evidence-link")
+def get_admin_report_evidence_link(
+    report_id: str,
+    _: dict[str, Any] = Depends(require_police_admin),
+) -> dict[str, Any]:
+    return create_evidence_access_link(report_id)
